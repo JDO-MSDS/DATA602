@@ -1,0 +1,468 @@
+---
+title: "DATA 607 Final Project NYC Housing & Rent Policy Analysis: Free Market vs. Rent Freeze"
+author: "Joao De Oliveira"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  echo = TRUE
+)
+```
+
+
+# Introduction
+New York City, particularly Manhattan, has experienced sustained rent increases over
+the last decades, fueling debates around affordability, displacement, and the role
+of rent regulation. In this project, I combine Zillow’s Observed Rent Index (ZORI)
+at the ZIP-code level with HUD Fair Market Rent (FMR) estimates for New York County
+to (1) describe recent rent trends and (2) model how a rent-freeze or 
+rent-stabilization policy might alter the trajectory of Manhattan rents compared
+with a simple “free-market” trend.
+
+The central question is:
+
+How might a rent-freeze or rent-stabilization policy alter the trajectory of 
+Manhattan rents compared with a continuation of recent free-market trends?
+
+The project follows a data science workflow: data acquisition from at least two 
+different sources, data cleaning and transformation, exploratory analysis, 
+statistical modeling (linear regression), visualization, and scenario simulation,
+with all steps implemented in a R Markdown document and GitHub repository.
+
+
+# Data
+
+## Packages
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(broom)
+library(scales)
+library(sf)
+library(tigris)
+options(tigris_use_cache = TRUE, tigris_quiet = TRUE)
+```
+
+
+## Data Sources
+
+1. Zillow ZORI – ZIP-level rent index (uploaded)
+
+File: Zip_zori_uc_sfrcondomfr_sm_month.csv (Zillow Observed Rent Index, by ZIP)
+
+This file has monthly rent index values for all US ZIP codes, including Manhattan.
+
+Use: aggregate Manhattan ZIP codes to obtain a Manhattan ZORI series.
+
+
+2. HUD Fair Market Rent (FMR) – New York County
+
+File (cleaned from FMR_All_1983_2026.csv): 
+hud_manhattan_fmr_1983_2026.csv
+
+https://www.huduser.gov/portal/datasets/fmr.html#history 
+
+The file has annual 1-bedroom fair market rent estimates for New York County 
+(Manhattan), 1983–2026.
+
+Use: level-of-rent measure, suitable for modeling and policy interpretation.
+
+In the GitHub repo, I included a short README documenting the original HUD file 
+(FMR_All_1983_2026.csv) and how hud_manhattan_fmr_1983_2026.csv was derived.
+
+
+## Import & initial cleaning
+
+**ZORI: Manhattan ZIP-level aggregation**
+
+```{r zori}
+zori_raw <- read_csv("C:\\Users\\jpfer\\OneDrive\\Ambiente de Trabalho\\DATA\\DATA607_FINAL\\Zip_zori_uc_sfrcondomfr_sm_month.csv") %>%
+clean_names()
+
+glimpse(zori_raw)
+```
+
+The ZORI file includes columns such as: `region_id`, `region_name` (ZIP code),
+`city`,`county_name`, `state`, and Monthly columns like `2015-01-31`, `2015-02-28`, ...
+
+I will keep only New York County (Manhattan) ZIPs, pivot to long format, and 
+aggregate by year:
+
+```{r zori-form}
+zori_manhattan <- zori_raw %>%
+  filter(county_name == "New York County", state == "NY") %>%
+  pivot_longer(
+    cols = -c(
+      region_id,
+      size_rank,
+      region_name,
+      region_type,
+      state_name,
+      state,
+      city,
+      metro,
+      county_name
+    ),
+    names_to = "date",
+    values_to = "zori"
+  ) %>%
+  mutate(
+    # clean the column names that became "date"
+    date = gsub("^x", "", date),      
+    date = gsub("_", "-", date),      
+    date = as.Date(date, format = "%Y-%m-%d"),
+    year = lubridate::year(date)
+  ) %>%
+  group_by(year) %>%
+  summarize(
+    zori_mean = mean(zori, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+zori_manhattan
+```
+
+
+**HUD FMR: Manhattan 1-bedroom time series**
+
+```{r fmr}
+hud_nyc <- read_csv("C:\\Users\\jpfer\\OneDrive\\Ambiente de Trabalho\\DATA\\DATA607_FINAL\\hud_manhattan_fmr_1983_2026.csv") %>%
+clean_names() %>%
+mutate(
+year = as.integer(year),
+fmr_1br = as.numeric(fmr_1br)
+) %>%
+arrange(year)
+
+hud_nyc
+```
+
+For this analysis, I will focus on the modern period where both datasets overlap
+reasonably well, e.g., 2015–2024.
+
+```{r fmr-form}
+rent_combined <- hud_nyc %>%
+inner_join(zori_manhattan, by = "year") %>%
+filter(year >= 2015, year <= 2024) %>%
+arrange(year)
+
+rent_combined
+```
+
+This table is the primary modeling dataset, with:
+- `year`
+- `fmr_1br` (HUD Fair Market Rent, NYC County)
+- `zori_mean` (average Manhattan ZORI for that year)
+
+
+# Exploratory Data Analysis
+
+## Time trend in Manhattan FMR
+
+```{r fmr-trend}
+ggplot(hud_nyc %>% filter(year >= 2000), aes(x = year, y = fmr_1br)) +
+geom_line() +
+geom_point() +
+scale_y_continuous(labels = dollar_format()) +
+labs(
+title = "HUD Fair Market Rent (1BR) – New York County (2000–2026)",
+x = "Year",
+y = "FMR (1-bedroom, USD)",
+caption = "Source: HUD FMR All 1983–2026 (cleaned for New York County)"
+)
+```
+
+
+## Comparing HUD FMR vs Manhattan ZORI
+
+```{r fmr-zori-trend}
+ggplot(rent_combined, aes(x = year)) +
+geom_line(aes(y = fmr_1br, color = "HUD FMR 1BR")) +
+geom_line(aes(y = zori_mean, color = "ZORI (Manhattan mean)")) +
+scale_y_continuous(labels = dollar_format()) +
+scale_color_manual(values = c("HUD FMR 1BR" = "black", "ZORI (Manhattan mean)" = "blue")) +
+labs(
+title = "HUD FMR vs ZORI – Manhattan (2015–2024)",
+x = "Year",
+y = "Rent Level / Index (USD-equivalent)",
+color = "Series",
+caption = "Source: HUD FMR (New York County) & Zillow ZORI (Manhattan ZIPs)"
+)
+```
+
+They seem to have a similar pattern with exception for the COVID period despite
+different values.
+
+
+# Modeling a Free-Market Rent Trajectory
+
+I use a linear regression of FMR on year for the period 2015–2024. This serves as
+a stylized representation of a “free-market trend.”
+
+## Linear regression: FMR ~ year
+
+```{r linear-regression}
+rent_model_data <- rent_combined %>%
+mutate(year_centered = year - mean(year))
+
+lm_free_market <- lm(fmr_1br ~ year_centered, data = rent_model_data)
+
+summary(lm_free_market)
+tidy(lm_free_market)
+glance(lm_free_market)
+```
+
+The linear regression model indicates a strong and statistically significant upward
+trend in Manhattan’s one-bedroom Fair Market Rent between 2015 and 2024. The 
+estimated slope of 124.4 suggests that rents increased by roughly $124 per year 
+during this period (p < 0.001). The model explains approximately 95% of the 
+variation in annual FMR levels, indicating an exceptionally good fit for a simple
+time-trend model. These results support the idea that Manhattan rents have risen
+steadily under free-market conditions, providing a useful baseline for comparing
+alternative policy scenarios such as a rent freeze or rent stabilization cap. 
+Actual annual FMR values are, on average, about $87 away from the fitted trend line.
+
+
+## Model fit vs actual
+
+```{r model-actual}
+rent_model_aug <- augment(lm_free_market, data = rent_model_data)
+
+ggplot(rent_model_aug, aes(x = year, y = fmr_1br)) +
+geom_point(color = "black") +
+geom_line(aes(y = .fitted), color = "red") +
+scale_y_continuous(labels = dollar_format()) +
+labs(
+title = "Free-Market Linear Trend vs Actual FMR – Manhattan (2015–2024)",
+x = "Year",
+y = "HUD FMR (1BR, USD)",
+caption = "Black = actual FMR; red = fitted trend line."
+)
+```
+
+
+# Policy Scenarios: Free Market vs Rent Freeze / Stabilization
+
+We now project the model forward 2025–2030 and compare:
+
+- Estimated free-market trajectory from the linear model
+- A rent freeze (holding FMR constant at 2024 level)
+- A rent stabilization (e.g., capped at 1% increase per year)
+
+
+## Forecast using linear model
+
+```{r forecast}
+future_years <- tibble(
+year = 2025:2030
+) %>%
+mutate(
+year_centered = year - mean(rent_model_data$year)
+)
+
+free_market_pred <- augment(
+lm_free_market,
+newdata = future_years
+) %>%
+transmute(
+year,
+fmr_1br = .fitted,
+scenario = "Free market"
+)
+
+free_market_pred
+```
+
+
+## Rent-freeze and stabilization scenarios
+
+```{r scenarios}
+fmr_2024 <- rent_model_data %>%
+filter(year == 2024) %>%
+pull(fmr_1br)
+
+freeze_scenario <- future_years %>%
+transmute(
+year,
+fmr_1br = fmr_2024,
+scenario = "Rent freeze"
+)
+
+stabilized_scenario <- future_years %>%
+transmute(
+year,
+fmr_1br = fmr_2024 * (1.01 ^ (year - 2024)),
+scenario = "Rent stabilization (1% cap)"
+)
+
+historical <- hud_nyc %>%
+filter(year >= 2015, year <= 2024) %>%
+transmute(
+year,
+fmr_1br,
+scenario = "Historical"
+)
+
+scenario_all <- bind_rows(
+historical,
+free_market_pred,
+freeze_scenario,
+stabilized_scenario
+)
+
+scenario_all
+```
+
+
+## Visual comparison of policy paths
+
+```{r visual-comparison}
+ggplot(
+scenario_all,
+aes(x = year, y = fmr_1br, color = scenario)
+) +
+geom_line(size = 1.1) +
+geom_point(data = subset(scenario_all, scenario == "Historical")) +
+scale_y_continuous(labels = dollar_format()) +
+labs(
+title = "Manhattan 1BR Fair Market Rent: Historical vs Policy Scenarios",
+x = "Year",
+y = "FMR (1BR, USD)",
+color = "Scenario",
+caption = "Historical FMR from HUD; projections via linear trend and policy assumptions."
+)
+```
+
+
+## Quantifying the policy impact in 2030
+
+```{r impact}
+scenario_2030 <- scenario_all %>%
+filter(year == 2030) %>%
+select(year, scenario, fmr_1br) %>%
+arrange(desc(fmr_1br))
+
+scenario_2030
+
+baseline_2030 <- scenario_2030 %>%
+filter(scenario == "Free market") %>%
+pull(fmr_1br)
+
+scenario_2030 %>%
+mutate(
+diff_vs_free_market = fmr_1br - baseline_2030,
+diff_vs_free_market_pct = diff_vs_free_market / baseline_2030
+)
+```
+
+
+The scenario analysis for 2030 compares projected Manhattan Fair Market Rents (FMR)
+under three different conditions: a continuation of free-market trends, a 
+rent-stabilization policy with a 1% annual cap, and a full rent freeze beginning
+in 2024. The free-market forecast—based on the statistically significant linear 
+trend estimated from 2015–2024—projects a 1-bedroom FMR of approximately 
+$3,043 by 2030. Under a rent stabilization policy limiting annual increases to 1%,
+the projected 2030 FMR falls to about $2,602, which is roughly $442 lower than 
+the free-market projection. This represents a 14.6% reduction relative to the 
+free-market level. The rent freeze scenario generates the largest divergence: by
+holding rents constant at the 2024 level, the model estimates a 2030 FMR 
+of $2,451, which is $593 below the free-market projection—a 19.5% reduction in 
+rent levels.
+
+Overall, these results suggest that policy interventions have a meaningful potential
+impact on long-term housing affordability. Even modest stabilization policies 
+significantly slow the pace of rent increases, while a full rent freeze produces
+substantial divergence from expected free-market trends over a six-year period.
+Although the model is not causal and does not account for broader economic or market
+feedback effects, the projections provide a clear quantitative illustration of 
+how rent-regulation strategies could reshape Manhattan’s rental landscape by 2030.
+
+
+# Mapping Manhattan
+
+Below you can find a simple geospatial map using Census shapefiles to highlight 
+Manhattan and annotate it with the latest FMR level.
+
+```{r geospatial}
+# Get NY state counties shapefile
+ny_counties <- counties(state = "NY", cb = TRUE, year = 2023) %>%
+  st_transform(4326)
+
+# Filter for Manhattan (New York County)
+manhattan_sf <- ny_counties %>%
+  filter(NAME == "New York")
+
+# Latest FMR value
+latest_fmr <- hud_nyc %>%
+  filter(year == max(year)) %>%
+  pull(fmr_1br)
+
+manhattan_sf <- manhattan_sf %>%
+  mutate(fmr1_latest = latest_fmr)
+
+ggplot(manhattan_sf) +
+  geom_sf(aes(fill = fmr1_latest), color = "white", size = 0.4) +
+  scale_fill_gradient(
+    name = "FMR (1BR, USD)",
+    labels = scales::dollar_format()
+  ) +
+  labs(
+    title = "Manhattan (New York County)",
+    subtitle = paste0("Latest HUD Fair Market Rent for 1BR Units: ",
+                      scales::dollar(latest_fmr)),
+    caption = "Spatial Feature created using Census shapefiles via tigris/sf."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 13)
+  )
+```
+
+
+# Discussion
+The regression results show that Manhattan’s 1-bedroom Fair Market Rent (FMR) 
+increased by about $124 per year from 2015–2024, with an R² of 0.955, indicating
+a very consistent upward trend. Using this trend to project rents forward, the 
+free-market model estimates a 2030 FMR of $3,043.
+
+The policy scenarios reveal meaningful differences. A 1% rent-stabilization cap 
+produces a projected 2030 rent of $2,602, which is $442 (14.6%) lower than the 
+free-market estimate. A rent freeze results in an even larger reduction, with a 
+2030 rent level of $2,451, or $593 (19.5%) below the free-market projection. 
+These results suggest that even modest regulation substantially slows rent growth,
+and a full freeze would produce the largest affordability gains.
+
+While this analysis does not model causal effects or market feedback responses,
+it clearly illustrates how different policy approaches could reshape Manhattan’s
+rent trajectory. Even simple regulatory interventions lead to noticeably lower 
+projected rents compared to an unregulated free-market path.
+
+
+# Conclusion
+This project combines two independent sources of rental information—Zillow ZORI 
+and HUD Fair Market Rents—to describe Manhattan’s rent trajectory and explore the
+implications of hypothetical rent-freeze and rent-stabilization policies. A simple
+linear model suggests continued rent growth under a free-market scenario, while 
+simulated policy interventions yield substantially lower projected rent levels 
+by 2030. While stylized, this analysis illustrates how publicly available data 
+can be used to inform debates about housing affordability and rent regulation in
+New York City.
